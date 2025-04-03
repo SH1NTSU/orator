@@ -6,6 +6,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 type SpeechRequest struct {
@@ -17,16 +21,21 @@ type SpeechRequest struct {
 }
 
 type Job struct {
-	Request  SpeechRequest
-	Response chan string
-	Error    chan error
+	ID        string
+	Request   SpeechRequest
+	FilePath  string
+	Status    string
+	Error     string
+	CreatedAt time.Time
 }
 
-var jobQueue chan Job
+var (
+	jobQueue  = make(chan Job, 10)
+	jobs      = make(map[string]*Job)
+	jobsMutex = sync.Mutex{}
+)
 
 func InitWorkerPool(workerCount int) {
-	jobQueue = make(chan Job, 10)
-
 	for i := 0; i < workerCount; i++ {
 		go worker()
 	}
@@ -34,12 +43,20 @@ func InitWorkerPool(workerCount int) {
 
 func worker() {
 	for job := range jobQueue {
+		jobsMutex.Lock()
+		job.Status = "processing"
+		jobsMutex.Unlock()
+
 		filename, err := processSpeech(job.Request)
+		jobsMutex.Lock()
 		if err != nil {
-			job.Error <- err
+			job.Status = "failed"
+			job.Error = err.Error()
 		} else {
-			job.Response <- filename
+			job.Status = "completed"
+			job.FilePath = filename
 		}
+		jobsMutex.Unlock()
 	}
 }
 
@@ -75,20 +92,60 @@ func ToSpeech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseChan := make(chan string)
-	errorChan := make(chan error)
+	jobID := uuid.New().String()
+	job := Job{
+		ID:        jobID,
+		Request:   rq,
+		Status:    "pending",
+		CreatedAt: time.Now(),
+	}
 
-	job := Job{Request: rq, Response: responseChan, Error: errorChan}
+	jobsMutex.Lock()
+	jobs[jobID] = &job
+	jobsMutex.Unlock()
 
 	jobQueue <- job
 
-	select {
-	case file := <-responseChan:
-		w.Header().Set("Content-Type", "audio/wav")
-		w.Header().Set("Content-Disposition", "attachment; filename=speech.wav")
-		http.ServeFile(w, r, file)
-		_ = os.Remove(file)
-	case err := <-errorChan:
-		http.Error(w, "Failed to synthesize speech: "+err.Error(), http.StatusInternalServerError)
+	response := map[string]string{"job_id": jobID}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func JobStatus(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("job_id")
+	if jobID == "" {
+		http.Error(w, "Missing job_id parameter", http.StatusBadRequest)
+		return
 	}
+
+	jobsMutex.Lock()
+	job, exists := jobs[jobID]
+	jobsMutex.Unlock()
+
+	if !exists {
+		http.Error(w, "Job not found", http.StatusNotFound)
+		return
+	}
+
+	if job.Status == "completed" {
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", job.FilePath))
+		http.ServeFile(w, r, job.FilePath)
+		_ = os.Remove(job.FilePath)
+	} else {
+		response := map[string]string{"status": job.Status, "error": job.Error}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+func SetParameter(w http.ResponseWriter, r *http.Request) {
+	var newParams SpeechRequest
+	if err := json.NewDecoder(r.Body).Decode(&newParams); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(newParams)
 }

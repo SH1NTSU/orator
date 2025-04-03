@@ -8,116 +8,118 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	Voice     string `json:"voice"`
-	Speed     int    `json:"speed"`
-	Pitch     int    `json:"pitch"`
-	Amplitude int    `json:"amplitude"`
+	Voice     string `json:"voice,omitempty"`
+	Speed     int    `json:"speed,omitempty"`
+	Pitch     int    `json:"pitch,omitempty"`
+	Amplitude int    `json:"amplitude,omitempty"`
 }
 
-var (
-	synthesisConfig Config
-	outputFile      string
-	textFile        string
-)
+var synthesisConfig = Config{
+	Voice:     "en-us",
+	Speed:     175,
+	Pitch:     50,
+	Amplitude: 100,
+}
 
 func main() {
-	loadDefaultArgs()
 	args := os.Args[1:]
-	var text string
 
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch {
-		case arg == "-o" && i+1 < len(args):
-			outputFile = args[i+1]
-			i++
-		case arg == "-s" && i+1 < len(args):
-			textFile = args[i+1]
-			i++
-		case strings.HasPrefix(arg, "-"):
-			param := strings.TrimPrefix(arg, "-")
-			if i+1 < len(args) {
-				setParameter(param, args[i+1])
-				i++
-			} else {
-				fmt.Printf("Error: Missing value for parameter %s\n", param)
-				os.Exit(1)
-			}
-		default:
-			if text == "" {
-				text = arg
-			} else {
-				text += " " + arg
-			}
-		}
+	if len(args) == 0 {
+		fmt.Println("Usage: orator <text> | -s <text_file> -o <output_file> | -<param> <value>")
+		os.Exit(1)
 	}
 
-	if textFile != "" {
-		content, err := os.ReadFile(textFile)
-		if err != nil {
-			fmt.Printf("Error reading text file: %v\n", err)
-			os.Exit(1)
-		}
-		text = string(content)
+	if strings.HasPrefix(args[0], "-") && len(args) > 1 {
+		setParameter(args[0][1:], args[1])
+		return
 	}
 
+	text, outputFile := parseArgs(args)
 	if text == "" {
 		fmt.Println("Error: No text provided for synthesis")
 		os.Exit(1)
 	}
 
-	sendRequest(text, outputFile)
+	jobID := sendRequest(text)
+	pollForResult(jobID, outputFile)
 }
 
-func loadDefaultArgs() {
-	synthesisConfig = Config{
-		Voice:     "en-us",
-		Speed:     175,
-		Pitch:     50,
-		Amplitude: 100,
+func parseArgs(args []string) (string, string) {
+	var text, outputFile string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o":
+			if i+1 < len(args) {
+				outputFile = args[i+1]
+				i++
+			}
+		case "-s":
+			if i+1 < len(args) {
+				content, err := os.ReadFile(args[i+1])
+				if err != nil {
+					fmt.Println("Error reading file:", err)
+					os.Exit(1)
+				}
+				text = string(content)
+				i++
+			}
+		default:
+			if text == "" {
+				text = args[i]
+			} else {
+				text += " " + args[i]
+			}
+		}
 	}
-	outputFile = ""
-	textFile = ""
+	return text, outputFile
 }
 
-func setParameter(name, value string) {
-	switch name {
+func setParameter(param, value string) {
+	paramMap := map[string]interface{}{}
+	switch param {
+	case "speed", "pitch", "amplitude":
+		var intValue int
+		_, err := fmt.Sscanf(value, "%d", &intValue)
+		if err != nil {
+			fmt.Printf("Invalid value for %s. Must be an integer.\n", param)
+			os.Exit(1)
+		}
+		paramMap[param] = intValue
 	case "voice":
-		synthesisConfig.Voice = value
-	case "speed":
-		var speed int
-		_, err := fmt.Sscanf(value, "%d", &speed)
-		if err != nil || speed <= 0 {
-			fmt.Println("Error: speed must be a positive integer")
-			os.Exit(1)
-		}
-		synthesisConfig.Speed = speed
-	case "pitch":
-		var pitch int
-		_, err := fmt.Sscanf(value, "%d", &pitch)
-		if err != nil || pitch < 0 || pitch > 99 {
-			fmt.Println("Error: pitch must be between 0 and 99")
-			os.Exit(1)
-		}
-		synthesisConfig.Pitch = pitch
-	case "amplitude":
-		var amplitude int
-		_, err := fmt.Sscanf(value, "%d", &amplitude)
-		if err != nil || amplitude < 0 || amplitude > 200 {
-			fmt.Println("Error: amplitude must be between 0 and 200")
-			os.Exit(1)
-		}
-		synthesisConfig.Amplitude = amplitude
+		paramMap["voice"] = value
 	default:
-		fmt.Printf("Error: Unknown parameter '%s'\n", name)
+		fmt.Println("Invalid parameter:", param)
 		os.Exit(1)
 	}
+
+	reqBody, _ := json.Marshal(paramMap)
+	req, err := http.NewRequest("PATCH", "http://localhost:8080/api/v1/set_parameter", bytes.NewBuffer(reqBody))
+	if err != nil {
+		fmt.Println("Error creating request:", err)
+		os.Exit(1)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("Error sending request:", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		fmt.Println("Parameter updated successfully.")
+	} else {
+		fmt.Println("Failed to update parameter.")
+	}
 }
 
-func sendRequest(text, outputFile string) {
+func sendRequest(text string) string {
 	requestBody := map[string]interface{}{
 		"text":      text,
 		"voice":     synthesisConfig.Voice,
@@ -126,12 +128,7 @@ func sendRequest(text, outputFile string) {
 		"amplitude": synthesisConfig.Amplitude,
 	}
 
-	reqBody, err := json.Marshal(requestBody)
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		os.Exit(1)
-	}
-
+	reqBody, _ := json.Marshal(requestBody)
 	resp, err := http.Post("http://localhost:8080/api/v1/to_speech", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
 		fmt.Println("Error sending request:", err)
@@ -139,27 +136,27 @@ func sendRequest(text, outputFile string) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("Error from server (status %d): %s\n", resp.StatusCode, string(body))
-		os.Exit(1)
-	}
+	var response map[string]string
+	json.NewDecoder(resp.Body).Decode(&response)
+	return response["job_id"]
+}
 
-	if outputFile != "" {
-		outFile, err := os.Create(outputFile)
-		if err != nil {
-			fmt.Println("Error creating output file:", err)
-			os.Exit(1)
-		}
-		defer outFile.Close()
+func pollForResult(jobID, outputFile string) {
+	for {
+		resp, _ := http.Get(fmt.Sprintf("http://localhost:8080/job_status?job_id=%s", jobID))
+		defer resp.Body.Close()
 
-		_, err = io.Copy(outFile, resp.Body)
-		if err != nil {
-			fmt.Println("Error saving audio:", err)
-			os.Exit(1)
+		if resp.StatusCode == http.StatusOK {
+			if outputFile != "" {
+				file, _ := os.Create(outputFile)
+				io.Copy(file, resp.Body)
+				fmt.Printf("Speech saved to %s\n", outputFile)
+			} else {
+				fmt.Println("Speech synthesis completed.")
+			}
+			return
 		}
-		fmt.Printf("Speech saved to %s\n", outputFile)
-	} else {
-		fmt.Println("Speech synthesized successfully")
+
+		time.Sleep(2 * time.Second)
 	}
 }

@@ -29,5 +29,5 @@ func loadRoutes() *chi.Mux {
 func loadHandlerRoutes(router chi.Router) {
 	Handler := &handlers.Order{}
 	router.Post("/to_speech", Handler.ToSpeach)
-	router.Post("/set_params", Handler.SetParameter)
+	router.Patch("/set_parameter", Handler.SetParameter)
 }
